@@ -1,56 +1,4 @@
-import 'dotenv/config';
-import express from 'express';
-import QRCode from 'qrcode';
-import qrcodeTerminal from 'qrcode-terminal';
-import pino from 'pino';
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import { useSupabaseAuthState } from './sessionStore.js';
-import { handleMessage } from './botLogic.js';
-
-const PORT = process.env.PORT || 3000;
-// Lets you run multiple bot numbers off one Supabase project by giving each
-// its own SESSION_ID — defaults to a single session if unset.
-const SESSION_ID = process.env.SESSION_ID || 'default-session';
-
-const app = express();
-let latestQR = null;
-let isConnected = false;
-
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    whatsapp_connected: isConnected,
-    uptime_seconds: Math.floor(process.uptime()),
-  });
-});
-
-app.get('/qr', async (_req, res) => {
-  if (isConnected) {
-    return res.send('<h2>✅ WhatsApp already connected. No QR needed.</h2>');
-  }
-  if (!latestQR) {
-    return res.send(
-      '<h2>⏳ QR not generated yet — refresh in a few seconds.</h2>' +
-        '<script>setTimeout(() => location.reload(), 5000);</script>'
-    );
-  }
-
-  const qrImage = await QRCode.toDataURL(latestQR);
-  res.send(`
-    <html>
-      <body style="display:flex;flex-direction:column;align-items:center;font-family:sans-serif;margin-top:40px;">
-        <h2>Scan this QR with WhatsApp</h2>
-        <img src="${qrImage}" width="300" height="300" alt="WhatsApp QR code" />
-        <p>Open WhatsApp → Linked Devices → Link a Device</p>
-        <p>Page auto-refreshes every 10s</p>
-        <script>setTimeout(() => location.reload(), 10000);</script>
-      </body>
-    </html>
-  `);
-});
-
-async function startBot() {
+function startBot() {
   const { state, saveCreds } = await useSupabaseAuthState(SESSION_ID);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -133,4 +81,4 @@ app.listen(PORT, () => {
   console.log('   QR code:      /qr');
 });
 
-startBot().catch((err) => console.error('❌ Failed to start bot:', err));
+startBot().catch((err) => console.error('❌ Failed to start
