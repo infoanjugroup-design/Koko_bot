@@ -1,12 +1,13 @@
 import supabase from './supabase.js';
 
 // ---------------------------------------------------------------------------
-// Config
+// Config & Economy Parameters
 // ---------------------------------------------------------------------------
 const SIGNUP_BONUS = 50;
 const DAILY_BONUS = 10;
+const QR_CLAIM_BONUS = 50;
 const QUIZ_COIN_PER_ANSWER = 5;
-const QUIZ_JACKPOT_BONUS = 20; // 5/5 score karne par extra reward
+const QUIZ_JACKPOT_BONUS = 20; // Extra bonus for 5/5 score
 const DAILY_COOLDOWN_HOURS = 24;
 
 const QUIZ_QUESTIONS = [
@@ -33,7 +34,7 @@ const QUIZ_QUESTIONS = [
 ];
 
 // ---------------------------------------------------------------------------
-// Data access helpers
+// Database Access Helpers
 // ---------------------------------------------------------------------------
 async function getOrCreateUser(phone) {
   const { data: existing, error: selectError } = await supabase
@@ -67,7 +68,7 @@ async function getOrCreateUser(phone) {
   return created;
 }
 
-// Add/Deduct coins safely with RPC or direct table fallback
+// Add/Deduct coins safely with RPC or fallback direct database update
 async function addCoins(userId, amount, type, description = null) {
   try {
     const { data, error } = await supabase.rpc('add_user_coins', {
@@ -79,7 +80,7 @@ async function addCoins(userId, amount, type, description = null) {
 
     if (!error && typeof data === 'number') return data;
   } catch (rpcErr) {
-    console.warn('RPC add_user_coins not found, falling back to direct table update...');
+    console.warn('RPC add_user_coins failed or not found, falling back to direct table update...');
   }
 
   // Fallback direct update
@@ -135,15 +136,74 @@ async function clearQuizState(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Reply builders
+// QR Verification & Handshake Logic (New Additive Module)
+// ---------------------------------------------------------------------------
+async function handleQrVerification(phone, text) {
+  const parts = text.split('_');
+  const uuid = parts.slice(1).join('_').trim();
+
+  if (!uuid) {
+    return '❌ Invalid QR payload. Please rescan the QR code from the screen.';
+  }
+
+  // 1. Check if UUID exists and is pending
+  const { data: session, error } = await supabase
+    .from('qr_verifications')
+    .select('*')
+    .eq('verification_uuid', uuid)
+    .eq('status', 'pending')
+    .maybeSingle();
+
+  if (error || !session) {
+    return '❌ *Invalid or Expired QR Code!*\nPlease refresh the product dashboard to generate a fresh QR code.';
+  }
+
+  // 2. Check Expiry
+  if (session.expires_at && new Date(session.expires_at).getTime() < Date.now()) {
+    await supabase
+      .from('qr_verifications')
+      .update({ status: 'expired' })
+      .eq('verification_uuid', uuid);
+    return '⌛ *QR Code Expired!*\nPlease refresh your browser dashboard to generate a new QR.';
+  }
+
+  // 3. Mark as verified & link sender phone
+  await supabase
+    .from('qr_verifications')
+    .update({
+      status: 'verified',
+      whatsapp_phone: phone,
+    })
+    .eq('verification_uuid', uuid);
+
+  // 4. Ensure user exists and credit QR claim bonus
+  const user = await getOrCreateUser(phone);
+  const updatedBalance = await addCoins(
+    user.id,
+    QR_CLAIM_BONUS,
+    'qr_claim',
+    `Verified Web Session: ${uuid.substring(0, 8)}...`
+  );
+
+  return (
+    `✅ *Authentication Successful!*\n\n` +
+    `🔗 Your WhatsApp number (*${phone}*) is now securely connected to the dashboard.\n` +
+    `🎉 *+${QR_CLAIM_BONUS} Coins* credited to your wallet!\n` +
+    `💰 Current Balance: *${updatedBalance} coins*\n\n` +
+    `${helpText()}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Response Builders
 // ---------------------------------------------------------------------------
 function helpText() {
   return (
     `🤖 *Bot Commands Menu*\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `• *!balance* — Check wallet balance\n` +
-    `• *!daily* — Claim daily +${DAILY_BONUS} free coins\n` +
-    `• *!quiz* — Start 5-question quiz (+${QUIZ_COIN_PER_ANSWER} coins/correct)\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `• *!balance* — Check your coin balance\n` +
+    `• *!daily* — Claim daily free +${DAILY_BONUS} coins\n` +
+    `• *!quiz* — Play 5-question quiz (+${QUIZ_COIN_PER_ANSWER} coins/correct)\n` +
     `• *!cancel* — Exit active quiz session\n` +
     `• *!help* — Show this menu`
   );
@@ -197,7 +257,7 @@ async function startQuiz(user) {
     `Reply with *A*, *B*, *C*, or *D*.\n` +
     `💰 Reward: *+${QUIZ_COIN_PER_ANSWER} coins* per correct answer.\n` +
     `Type *!cancel* anytime to quit.\n\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
     `${QUIZ_QUESTIONS[0].q}`
   );
 }
@@ -244,18 +304,25 @@ async function handleQuizAnswer(user, rawText) {
 
   // Next Question
   await setQuizState(user.id, state);
-  return `${feedback}\n\n━━━━━━━━━━━━━━━━━\n${QUIZ_QUESTIONS[state.index].q}`;
+  return `${feedback}\n\n━━━━━━━━━━━━━━━━━━━━\n${QUIZ_QUESTIONS[state.index].q}`;
 }
 
 // ---------------------------------------------------------------------------
-// Main dispatcher
+// Main Message Router
 // ---------------------------------------------------------------------------
 export async function handleMessage(phone, rawText) {
   const text = (rawText || '').trim();
   const lower = text.toLowerCase();
+
+  // 1. QR Code / UUID Verification Intercept
+  if (lower.startsWith('verify_') || lower.startsWith('verify ')) {
+    const formattedText = text.replace('verify ', 'verify_');
+    return await handleQrVerification(phone, formattedText);
+  }
+
   const user = await getOrCreateUser(phone);
 
-  // Allow explicit cancel during quiz
+  // 2. Active Quiz Cancellation
   if (lower === '!cancel' || lower === '!exit') {
     if (user.quiz_state) {
       await clearQuizState(user.id);
@@ -264,15 +331,17 @@ export async function handleMessage(phone, rawText) {
     return `ℹ️ No active quiz session running.\n\n${helpText()}`;
   }
 
-  // In-progress quiz handler
+  // 3. In-Progress Quiz Handler (Blocks normal commands except !cancel)
   if (user.quiz_state && lower !== '!quiz') {
     return handleQuizAnswer(user, text);
   }
 
-  if (lower === 'hi' || lower === 'hello' || lower === 'hey' || lower === 'start') {
+  // 4. Greeting & Onboarding
+  if (['hi', 'hello', 'hey', 'start'].includes(lower)) {
     return handleGreeting(user);
   }
 
+  // 5. Standard Bot Commands
   switch (lower) {
     case '!balance':
     case '!coins': {
