@@ -1,63 +1,31 @@
-import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
+import { proto, initAuthCreds, BufferJSON } from '@whiskeysockets/baileys';
 import supabase from './supabase.js';
 
-const TABLE = 'sessions';
-
-/**
- * Reads one (session_id, key) row and revives Buffers via Baileys' own
- * BufferJSON reviver (Baileys creds/keys contain Buffer/Uint8Array fields
- * that plain JSON.stringify/parse would otherwise corrupt).
- */
-async function readData(sessionId, key) {
-  const { data, error } = await supabase
-    .from(TABLE)
+export async function useSupabaseAuthState(sessionId = 'default-session') {
+  // 1. Fetch credentials from DB
+  const { data: credsRow, error: credsError } = await supabase
+    .from('sessions')
     .select('value')
     .eq('session_id', sessionId)
-    .eq('key', key)
+    .eq('key', 'creds')
     .maybeSingle();
 
-  if (error) {
-    console.error(`[sessionStore] read failed for "${key}":`, error.message);
-    return null;
+  if (credsError) {
+    console.error('❌ Error fetching creds from Supabase:', credsError);
   }
-  if (!data) return null;
 
-  return JSON.parse(JSON.stringify(data.value), BufferJSON.reviver);
-}
-
-async function writeData(sessionId, key, value) {
-  const serialized = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
-
-  const { error } = await supabase
-    .from(TABLE)
-    .upsert(
-      { session_id: sessionId, key, value: serialized, updated_at: new Date().toISOString() },
-      { onConflict: 'session_id,key' }
-    );
-
-  if (error) console.error(`[sessionStore] write failed for "${key}":`, error.message);
-}
-
-async function removeData(sessionId, key) {
-  const { error } = await supabase.from(TABLE).delete().eq('session_id', sessionId).eq('key', key);
-  if (error) console.error(`[sessionStore] delete failed for "${key}":`, error.message);
-}
-
-/**
- * Drop-in replacement for Baileys' useMultiFileAuthState(), but persists
- * everything in Supabase Postgres instead of local files — so the login
- * session survives Render free-tier restarts/redeploys (which wipe disk).
- *
- * One row per key: ('creds'), ('pre-key-<id>'), ('session-<id>'),
- * ('sender-key-<id>'), ('app-state-sync-key-<id>'), etc.
- */
-export async function useSupabaseAuthState(sessionId = 'default-session') {
-  const storedCreds = await readData(sessionId, 'creds');
-  const creds = storedCreds || initAuthCreds();
-
-  const saveCreds = async () => {
-    await writeData(sessionId, 'creds', creds);
-  };
+  // Parse creds or initialize fresh
+  let creds;
+  if (credsRow?.value) {
+    try {
+      creds = JSON.parse(JSON.stringify(credsRow.value), BufferJSON.reviver);
+    } catch (e) {
+      console.warn('⚠️ Corrupted creds JSON, initializing fresh...');
+      creds = initAuthCreds();
+    }
+  } else {
+    creds = initAuthCreds();
+  }
 
   return {
     state: {
@@ -65,30 +33,88 @@ export async function useSupabaseAuthState(sessionId = 'default-session') {
       keys: {
         get: async (type, ids) => {
           const data = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(sessionId, `${type}-${id}`);
-              if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+          if (!ids || ids.length === 0) return data;
+
+          const keysToFetch = ids.map((id) => `${type}-${id}`);
+          const { data: rows, error } = await supabase
+            .from('sessions')
+            .select('key, value')
+            .eq('session_id', sessionId)
+            .in('key', keysToFetch);
+
+          if (error) {
+            console.error(`❌ Error fetching keys for ${type}:`, error);
+            return data;
+          }
+
+          for (const row of rows || []) {
+            const rawId = row.key.replace(`${type}-`, '');
+            try {
+              let parsed = JSON.parse(JSON.stringify(row.value), BufferJSON.reviver);
+              if (type === 'app-state-sync-key' && parsed) {
+                parsed = proto.Message.AppStateSyncKeyData.fromObject(parsed);
               }
-              data[id] = value;
-            })
-          );
-          return data;
-        },
-        set: async (data) => {
-          const tasks = [];
-          for (const category of Object.keys(data)) {
-            for (const id of Object.keys(data[category])) {
-              const value = data[category][id];
-              const key = `${category}-${id}`;
-              tasks.push(value ? writeData(sessionId, key, value) : removeData(sessionId, key));
+              data[rawId] = parsed;
+            } catch (err) {
+              console.error(`Error parsing key ${row.key}:`, err);
             }
           }
+          return data;
+        },
+
+        set: async (data) => {
+          const tasks = [];
+
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+
+              if (value) {
+                const serialized = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+                tasks.push(
+                  supabase.from('sessions').upsert(
+                    {
+                      session_id: sessionId,
+                      key,
+                      value: serialized,
+                      updated_at: new Date().toISOString(),
+                    },
+                    { onConflict: 'session_id,key' }
+                  )
+                );
+              } else {
+                tasks.push(
+                  supabase
+                    .from('sessions')
+                    .delete()
+                    .eq('session_id', sessionId)
+                    .eq('key', key)
+                );
+              }
+            }
+          }
+
           await Promise.all(tasks);
         },
       },
     },
-    saveCreds,
+
+    saveCreds: async () => {
+      const serializedCreds = JSON.parse(JSON.stringify(creds, BufferJSON.replacer));
+      const { error } = await supabase.from('sessions').upsert(
+        {
+          session_id: sessionId,
+          key: 'creds',
+          value: serializedCreds,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'session_id,key' }
+      );
+
+      if (error) {
+        console.error('❌ Failed to persist creds to Supabase:', error);
+      }
+    },
   };
 }
