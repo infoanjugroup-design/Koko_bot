@@ -2,13 +2,13 @@ import 'dotenv/config';
 import express from 'express';
 import QRCode from 'qrcode';
 import pino from 'pino';
-import baileysPkg, { 
-  DisconnectReason, 
-  fetchLatestBaileysVersion, 
-  Browsers, 
-  delay 
+import baileysPkg, {
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  delay,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
+import supabase from './supabase.js';
 import { useSupabaseAuthState } from './sessionStore.js';
 import { handleMessage } from './botLogic.js';
 
@@ -41,7 +41,7 @@ app.get('/qr', async (_req, res) => {
   if (!latestQR) {
     return res.send(
       '<h2>⏳ Initializing WhatsApp Socket...</h2>' +
-        '<p>Please refresh in 5 seconds or try linking via phone number.</p>' +
+        '<p>Please refresh in 5 seconds or link with phone number.</p>' +
         '<script>setTimeout(() => location.reload(), 5000);</script>' +
         '<p><a href="/link">👉 Link via Phone Number instead</a></p>'
     );
@@ -89,18 +89,16 @@ app.post('/link', async (req, res) => {
 
   const phone = (req.body.phone || '').replace(/[^0-9]/g, '');
   if (!phone || phone.length < 10) {
-    return res.send('<h2>❌ Invalid number format! Enter full number with country code (e.g. 919876543210).</h2><a href="/link">Back</a>');
+    return res.send('<h2>❌ Invalid number! Country code required (e.g. 919876543210).</h2><a href="/link">Back</a>');
   }
 
   try {
-    // Agar socket active nahi hai ya restart ho raha hai, wait karo
     if (!currentSock || !currentSock.ws?.isOpen) {
-      console.log('🔄 Re-starting socket before pairing request...');
+      console.log('🔄 Stabilizing socket before pairing request...');
       await startBot();
-      await delay(3000); // Allow socket to stabilize with WhatsApp gateway
+      await delay(3000);
     }
 
-    // Stabilize delay before pairing handshake
     await delay(1500);
 
     const code = await currentSock.requestPairingCode(phone);
@@ -112,7 +110,7 @@ app.post('/link', async (req, res) => {
           <h2>Your WhatsApp Pairing Code</h2>
           <p style="font-size:42px;font-weight:bold;letter-spacing:4px;background:#f0f0f0;padding:15px 30px;border-radius:8px;color:#128C7E;">${formatted}</p>
           <div style="max-width:400px;text-align:left;line-height:1.6;">
-            <b>Steps on your phone:</b>
+            <b>Steps on phone:</b>
             <ol>
               <li>Open WhatsApp</li>
               <li>Tap <b>Linked Devices</b> → <b>Link a Device</b></li>
@@ -126,20 +124,13 @@ app.post('/link', async (req, res) => {
       </html>
     `);
   } catch (err) {
-    console.error('Pairing code generation failed:', err);
-    
-    // Agar socket drop ho gaya, auto-reinitiate for next attempt
-    setTimeout(() => {
-      startBot().catch((e) => console.error('Background recovery error:', e));
-    }, 2000);
-
+    console.error('Pairing code error:', err);
     res.send(`
       <html>
         <body style="display:flex;flex-direction:column;align-items:center;font-family:sans-serif;margin-top:40px;">
           <h2>❌ Pairing Failed: ${err.message || 'Connection Closed'}</h2>
-          <p>WhatsApp server ne temporary handshake drop kar diya.</p>
-          <p><b>Koshish karein:</b> 10 second wait karke fir se submit karein.</p>
-          <a href="/link" style="padding:10px 20px;background:#007bff;color:#fff;text-decoration:none;border-radius:4px;">Try Again</a>
+          <p>Please wait 10 seconds and try again.</p>
+          <a href="/link">Try Again</a>
         </body>
       </html>
     `);
@@ -159,7 +150,7 @@ async function startBot() {
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['Ubuntu', 'Chrome', '20.0.04'], // Standard accepted string format
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false,
       markOnlineOnConnect: true,
       connectTimeoutMs: 60000,
@@ -177,25 +168,32 @@ async function startBot() {
 
       if (connection === 'close') {
         isConnected = false;
+        isConnecting = false;
         const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        console.log(`⚠️ Connection closed. Status Code: ${statusCode}`);
+
+        // PERMANENT FIX FOR 440 & 401 LOOP:
+        if (statusCode === 440 || statusCode === 401) {
+          console.error('❌ Session out of sync (440/401). Wiping session from Supabase...');
+          await supabase.from('sessions').delete().eq('session_id', SESSION_ID);
+          
+          // Exit process so Render restarts with clean slate (Zero crash loops)
+          setTimeout(() => process.exit(1), 1500);
+          return;
+        }
+
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
-        console.log(`⚠️ Connection closed (Status code: ${statusCode}). Reconnect: ${shouldReconnect}`);
-
         if (shouldReconnect) {
+          console.log('🔄 Reconnecting in 4 seconds...');
           setTimeout(() => {
-            isConnecting = false;
-            startBot().catch((err) => console.error('Auto-reconnect failed:', err));
+            startBot().catch((err) => console.error('Auto-reconnect error:', err));
           }, 4000);
-        } else {
-          isConnecting = false;
-          console.log('🔒 Logged out. Clear Supabase `sessions` table and restart.');
         }
       } else if (connection === 'open') {
         isConnected = true;
         isConnecting = false;
         latestQR = null;
-        console.log('✅ WhatsApp successfully connected!');
+        console.log('✅ WhatsApp bot successfully connected!');
       }
     });
 
@@ -228,10 +226,9 @@ async function startBot() {
         }
       }
     });
-
   } catch (initErr) {
     isConnecting = false;
-    console.error('Socket initialization error:', initErr);
+    console.error('Socket init error:', initErr);
   }
 }
 
