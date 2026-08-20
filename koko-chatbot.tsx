@@ -11,7 +11,8 @@ interface Message {
   options?: string[]; // Quick action buttons
 }
 
-export default function KokoChatbot() {
+export function KokoChatbot()
+ {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
     {
