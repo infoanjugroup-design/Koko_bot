@@ -2,17 +2,15 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useSearchParams, useRouter, usePathname } from 'next/navigation';
-
-type ChatMode = 'NORMAL' | 'AWAITING_LOGIN' | 'AWAITING_REGISTER';
+import { createClient } from '@/lib/supabase/client';
 
 interface Message {
   sender: 'user' | 'bot';
   text: string;
-  options?: string[]; // Quick action buttons
+  showGoogleLogin?: boolean;
 }
 
-export function KokoChatbot()
- {
+export function KokoChatbot() {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -21,168 +19,144 @@ export function KokoChatbot()
     },
   ]);
   const [input, setInput] = useState('');
-  const [currentMode, setCurrentMode] = useState<ChatMode>('NORMAL');
   const [scannedCode, setScannedCode] = useState<string | null>(null);
+  const [user, setUser] = useState<any>(null);
 
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
   const hasTriggeredRef = useRef(false);
 
-  // Message Handler & State Machine Logic
-  const handleSend = (customText?: string) => {
+  // Initialize Supabase Client
+  const supabase = createClient();
+
+  // 1. Check if user is logged in
+  useEffect(() => {
+    async function checkUser() {
+      const { data } = await supabase.auth.getUser();
+      if (data?.user) {
+        setUser(data.user);
+      }
+    }
+    checkUser();
+  }, [supabase]);
+
+  // 2. Google OAuth Login Trigger
+  const handleGoogleLogin = async () => {
+    try {
+      // Save pending scanned code to local storage before redirect
+      if (scannedCode) {
+        localStorage.setItem('koko_pending_code', scannedCode);
+      }
+
+      await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/post-login`,
+        },
+      });
+    } catch (error) {
+      console.error('Google Login Error:', error);
+    }
+  };
+
+  // 3. Message Send & Verification Handler
+  const handleSend = async (customText?: string) => {
     const query = (customText !== undefined ? customText : input).trim();
     if (!query) return;
 
-    // 1. User message chat UI mein add karein
     setMessages((prev) => [...prev, { sender: 'user', text: query }]);
     setInput('');
 
-    const cleanUpper = query.toUpperCase();
+    // Check code in Supabase
+    try {
+      const { data: userData } = await supabase.auth.getUser();
+      const currentUser = userData?.user;
 
-    // 2. Action Routing
-    setTimeout(() => {
-      // CASE 1: User ne "LOGIN" button click kiya ya text bheja
-      if (cleanUpper === 'LOGIN' || cleanUpper.includes('LOGIN')) {
-        setCurrentMode('AWAITING_LOGIN');
+      // Agar user logged in hai -> Direct Claim
+      if (currentUser) {
+        const { data: res, error } = await supabase.rpc('process_qr_verification', {
+          p_code: query,
+          p_user_id: currentUser.id,
+          p_session_id: currentUser.id,
+        });
+
+        if (error) throw error;
+
         setMessages((prev) => [
           ...prev,
           {
             sender: 'bot',
-            text: '🔐 Kripya apna registered **Email / Phone** aur **Password** enter karein:\n(Format: user@example.com, password123)',
-          },
-        ]);
-        return;
-      }
-
-      // CASE 2: User ne "REGISTER" button click kiya ya text bheja
-      if (cleanUpper === 'REGISTER' || cleanUpper.includes('REGISTER')) {
-        setCurrentMode('AWAITING_REGISTER');
-        setMessages((prev) => [
-          ...prev,
-          {
-            sender: 'bot',
-            text: '📝 Registration ke liye apna **Name, Email/Phone, Password** enter karein:\n(Format: Rahul, rahul@example.com, pass123)',
-          },
-        ]);
-        return;
-      }
-
-      // CASE 3: User ne Login Details submit ki
-      if (currentMode === 'AWAITING_LOGIN') {
-        setCurrentMode('NORMAL');
-        if (scannedCode) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              sender: 'bot',
-              text: `✅ *Login Successful!*\n\n🎉 Aapka pehle se scan kiya hua code (**${scannedCode}**) automatically verify ho gaya hai aur 50 KOKO Coins aapke wallet mein add ho gaye hain! 🍿`,
-            },
-          ]);
-        } else {
-          setMessages((prev) => [
-            ...prev,
-            {
-              sender: 'bot',
-              text: '✅ *Login Successful!*\nAap login ho chuke hain. Koi coupon code ho toh enter karein.',
-            },
-          ]);
-        }
-        return;
-      }
-
-      // CASE 4: User ne Register Details submit ki
-      if (currentMode === 'AWAITING_REGISTER') {
-        setCurrentMode('NORMAL');
-        if (scannedCode) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              sender: 'bot',
-              text: `🎉 *Account Created Successfully!*\n\nAapka welcome bonus aur code (**${scannedCode}**) ke 50 Coins credit kar diye gaye hain!`,
-            },
-          ]);
-        } else {
-          setMessages((prev) => [
-            ...prev,
-            {
-              sender: 'bot',
-              text: '🎉 *Account Created Successfully!*\nWelcome to Koko Foods! Ab aap shopping start kar sakte hain.',
-            },
-          ]);
-        }
-        return;
-      }
-
-      // CASE 5: User ne "SKIP" likha
-      if (cleanUpper === 'SKIP') {
-        setCurrentMode('NORMAL');
-        setMessages((prev) => [
-          ...prev,
-          {
-            sender: 'bot',
-            text: 'Thik hai! Aap direct shop browse kar sakte hain. Jab bhi coupon mile, yahan daal dijiyega.',
-          },
-        ]);
-        return;
-      }
-
-      // CASE 6: Scanned Code / Real Coupon check
-      if (cleanUpper.includes('KOKO') || cleanUpper.includes('CRUNCH') || cleanUpper.length >= 4) {
-        setScannedCode(query);
-        setMessages((prev) => [
-          ...prev,
-          {
-            sender: 'bot',
-            text: `🍿 Aapne packet/box scan kiya hai! Code: **${query}**\nCoins claim karne ke liye pehle **Login** ya **Register** karo — uske baad automatically claim ho jayega.`,
-            options: ['Login', 'Register', 'Skip'],
+            text: res.message,
+            showGoogleLogin: res.status === 'LOGIN_REQUIRED',
           },
         ]);
       } else {
+        // Agar user Guest hai -> Save to pending session and ask for Google Login
+        setScannedCode(query);
+
         setMessages((prev) => [
           ...prev,
           {
             sender: 'bot',
-            text: 'Ye coupon code valid nahi mila. Phir try karo, ya *SKIP* likho.',
+            text: `🍿 Aapne packet/box scan kiya hai! Code: **${query.toUpperCase()}**\n\nCoins claim karne ke liye kripya **Google** se Login ya Register karein:`,
+            showGoogleLogin: true,
           },
         ]);
       }
-    }, 400);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: 'bot',
+          text: 'Ye coupon/QR code valid nahi mila ya already claim ho chuka hai.',
+        },
+      ]);
+    }
   };
 
-  // URL Auto-open & QR Link Parameter Handler
+  // 4. Auto-Open, Auto-Type & Auto-Send on QR Scan
   useEffect(() => {
-    const couponParam = searchParams.get('coupon') || searchParams.get('code');
+    const qrParam =
+      searchParams.get('qr') ||
+      searchParams.get('code') ||
+      searchParams.get('coupon') ||
+      searchParams.get('token');
 
-    if (couponParam && !hasTriggeredRef.current) {
+    if (qrParam && !hasTriggeredRef.current) {
       hasTriggeredRef.current = true;
-      setIsOpen(true);
-      setScannedCode(couponParam);
 
-      // Input me automatically type aur trigger karein
-      const codeMsg = couponParam.toUpperCase();
+      // 1. Force Chatbot to OPEN
+      setIsOpen(true);
+      setScannedCode(qrParam);
+
+      // 2. Automatically Type in input
+      const codeMsg = qrParam.trim();
       setInput(codeMsg);
 
+      // 3. Automatically Trigger Send
       setTimeout(() => {
         handleSend(codeMsg);
 
-        // Address bar se query clean karein
+        // 4. Clean URL parameters
         const params = new URLSearchParams(searchParams.toString());
-        params.delete('coupon');
+        params.delete('qr');
         params.delete('code');
+        params.delete('coupon');
+        params.delete('token');
         const cleanUrl = params.toString() ? `${pathname}?${params.toString()}` : pathname;
         router.replace(cleanUrl, { scroll: false });
-      }, 500);
+      }, 300);
     }
   }, [searchParams, pathname, router]);
 
   return (
     <div className="fixed bottom-6 right-6 z-50">
-      {/* Floating Toggle Button */}
+      {/* Trigger Button */}
       {!isOpen && (
         <button
           onClick={() => setIsOpen(true)}
-          className="bg-amber-600 hover:bg-amber-700 text-white p-4 rounded-full shadow-2xl flex items-center justify-center transition-transform hover:scale-105 active:scale-95"
+          className="bg-amber-600 hover:bg-amber-700 text-white p-4 rounded-full shadow-2xl flex items-center justify-center transition-transform hover:scale-105 active:scale-95 text-xl"
         >
           💬
         </button>
@@ -192,11 +166,16 @@ export function KokoChatbot()
       {isOpen && (
         <div className="w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-stone-200 flex flex-col h-[500px] overflow-hidden">
           {/* Header */}
-          <div className="bg-amber-700 text-white px-4 py-3 flex justify-between items-center">
-            <span className="font-semibold text-sm">koko chatbot 🍿</span>
+          <div className="bg-slate-900 text-white px-4 py-3 flex justify-between items-center">
+            <div>
+              <div className="font-semibold text-sm">koko chatbot 🍿</div>
+              <div className="text-[11px] text-stone-300">
+                {user ? user.email : 'Guest • online'}
+              </div>
+            </div>
             <button
               onClick={() => setIsOpen(false)}
-              className="text-white hover:text-stone-200 text-lg leading-none"
+              className="text-stone-300 hover:text-white text-lg leading-none"
             >
               ✕
             </button>
@@ -207,7 +186,7 @@ export function KokoChatbot()
             {messages.map((msg, index) => (
               <div key={index} className="space-y-2">
                 <div
-                  className={`p-3 rounded-2xl max-w-[85%] whitespace-pre-line ${
+                  className={`p-3 rounded-2xl max-w-[85%] whitespace-pre-line text-xs sm:text-sm ${
                     msg.sender === 'user'
                       ? 'ml-auto bg-blue-600 text-white rounded-br-none'
                       : 'mr-auto bg-white border border-stone-200 text-stone-800 rounded-bl-none shadow-sm'
@@ -216,39 +195,48 @@ export function KokoChatbot()
                   {msg.text}
                 </div>
 
-                {/* Login / Register / Skip Interactive Buttons */}
-                {msg.options && (
-                  <div className="flex gap-2 flex-wrap">
-                    {msg.options.map((opt) => (
-                      <button
-                        key={opt}
-                        onClick={() => handleSend(opt)}
-                        className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-full shadow-sm transition-all"
-                      >
-                        {opt}
-                      </button>
-                    ))}
+                {/* Single Google Login Button */}
+                {msg.showGoogleLogin && (
+                  <div className="pt-1">
+                    <button
+                      onClick={handleGoogleLogin}
+                      className="w-full bg-white hover:bg-stone-50 text-stone-700 border border-stone-300 font-medium px-4 py-2 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-all text-xs"
+                    >
+                      <svg className="w-4 h-4" viewBox="0 0 24 24">
+                        <path
+                          fill="#4285F4"
+                          d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                        />
+                        <path
+                          fill="#34A853"
+                          d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                        />
+                        <path
+                          fill="#FBBC05"
+                          d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
+                        />
+                        <path
+                          fill="#EA4335"
+                          d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
+                        />
+                      </svg>
+                      Login / Register with Google
+                    </button>
                   </div>
                 )}
               </div>
             ))}
           </div>
 
-          {/* Message Input Box */}
+          {/* Input Box */}
           <div className="p-3 border-t border-stone-200 bg-white flex gap-2">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-              placeholder={
-                currentMode === 'AWAITING_LOGIN'
-                  ? 'Enter email, password...'
-                  : currentMode === 'AWAITING_REGISTER'
-                  ? 'Enter name, email, password...'
-                  : 'Type a message...'
-              }
-              className="flex-1 border border-stone-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-amber-600"
+              placeholder="Type a message or code..."
+              className="flex-1 border border-stone-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-amber-600 text-stone-900"
             />
             <button
               onClick={() => handleSend()}
@@ -263,3 +251,4 @@ export function KokoChatbot()
   );
 }
 
+export default KokoChatbot;
